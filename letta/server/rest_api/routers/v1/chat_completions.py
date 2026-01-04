@@ -30,7 +30,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = Field(None, ge=0, le=2, description="Sampling temperature")
     top_p: Optional[float] = Field(None, ge=0, le=1, description="Nucleus sampling parameter")
     n: Optional[int] = Field(1, ge=1, description="Number of chat completion choices to generate")
-    stream: Optional[bool] = Field(False, description="Whether to stream back partial progress")
+    stream: Optional[bool] = Field(True, description="Whether to stream back partial progress")
     stop: Optional[Union[str, list[str]]] = Field(None, description="Sequences where the API will stop generating")
     max_tokens: Optional[int] = Field(None, description="Maximum number of tokens to generate")
     presence_penalty: Optional[float] = Field(None, ge=-2, le=2, description="Presence penalty")
