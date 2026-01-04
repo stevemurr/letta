@@ -561,6 +561,8 @@ class OpenAIChatCompletionsStreamTransformer:
 
                 if message_type == "assistant_message":
                     return AssistantMessage(**data)
+                elif message_type == "reasoning_message":
+                    return ReasoningMessage(**data)
                 elif message_type == "usage_statistics":
                     return LettaUsageStatistics(**data)
                 elif message_type == "stop_reason":
