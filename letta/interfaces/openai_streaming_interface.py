@@ -832,14 +832,13 @@ class SimpleOpenAIStreamingInterface:
                 prev_message_type = assistant_msg.message_type
                 yield assistant_msg
 
-            if (
-                hasattr(chunk, "choices")
-                and len(chunk.choices) > 0
-                and hasattr(chunk.choices[0], "delta")
-                and hasattr(chunk.choices[0].delta, "reasoning_content")
-            ):
+            # Check for reasoning_content - may be a direct attribute (DeepSeek) or in model_extra (vLLM/Dynamo)
+            if hasattr(chunk, "choices") and len(chunk.choices) > 0 and hasattr(chunk.choices[0], "delta"):
                 delta = chunk.choices[0].delta
+                # Try direct attribute first (native support like DeepSeek), then model_extra (OpenAI-compatible endpoints)
                 reasoning_content = getattr(delta, "reasoning_content", None)
+                if reasoning_content is None and hasattr(delta, "model_extra") and delta.model_extra:
+                    reasoning_content = delta.model_extra.get("reasoning_content")
                 if reasoning_content is not None and reasoning_content != "":
                     if prev_message_type and prev_message_type != "reasoning_message":
                         message_index += 1
