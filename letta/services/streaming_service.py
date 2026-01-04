@@ -27,7 +27,7 @@ from letta.otel.metric_registry import MetricRegistry
 from letta.schemas.agent import AgentState
 from letta.schemas.enums import AgentType, MessageStreamStatus, RunStatus
 from letta.schemas.job import LettaRequestConfig
-from letta.schemas.letta_message import AssistantMessage, LettaErrorMessage, MessageType
+from letta.schemas.letta_message import AssistantMessage, LettaErrorMessage, MessageType, ReasoningMessage
 from letta.schemas.letta_message_content import TextContent
 from letta.schemas.letta_request import LettaStreamingRequest
 from letta.schemas.letta_response import LettaResponse
@@ -530,6 +530,7 @@ class OpenAIChatCompletionsStreamTransformer:
         self.model = model
         self.completion_id = completion_id
         self.first_chunk = True
+        self.in_thinking_block = False  # Track if we're inside a <think> block
         self.created = int(time.time())
 
     # TODO: This is lowkey really ugly and poor code design, but this works fine for now
@@ -560,6 +561,8 @@ class OpenAIChatCompletionsStreamTransformer:
 
                 if message_type == "assistant_message":
                     return AssistantMessage(**data)
+                elif message_type == "reasoning_message":
+                    return ReasoningMessage(**data)
                 elif message_type == "usage_statistics":
                     return LettaUsageStatistics(**data)
                 elif message_type == "stop_reason":
@@ -593,14 +596,37 @@ class OpenAIChatCompletionsStreamTransformer:
                 else:
                     chunk = raw_chunk
 
-                # only process assistant messages
-                if isinstance(chunk, AssistantMessage):
+                # process reasoning messages (thinking content) with <think> tags
+                if isinstance(chunk, ReasoningMessage):
+                    async for sse_chunk in self._process_reasoning_message(chunk):
+                        yield sse_chunk
+
+                # process assistant messages
+                elif isinstance(chunk, AssistantMessage):
                     async for sse_chunk in self._process_assistant_message(chunk):
                         print(f"CHUNK: {sse_chunk}")
                         yield sse_chunk
 
                 # handle completion status
                 elif chunk == MessageStreamStatus.done:
+                    # Close any open thinking block before finishing
+                    if self.in_thinking_block:
+                        self.in_thinking_block = False
+                        close_chunk = ChatCompletionChunk(
+                            id=self.completion_id,
+                            object="chat.completion.chunk",
+                            created=self.created,
+                            model=self.model,
+                            choices=[
+                                Choice(
+                                    index=0,
+                                    delta=ChoiceDelta(content="</think>"),
+                                    finish_reason=None,
+                                )
+                            ],
+                        )
+                        yield f"data: {close_chunk.model_dump_json()}\n\n"
+
                     # emit final chunk with finish_reason
                     final_chunk = ChatCompletionChunk(
                         id=self.completion_id,
@@ -638,6 +664,25 @@ class OpenAIChatCompletionsStreamTransformer:
         if not text_content:
             return
 
+        # Close any open thinking block before outputting assistant content
+        if self.in_thinking_block:
+            self.in_thinking_block = False
+            # Emit closing </think> tag
+            close_chunk = ChatCompletionChunk(
+                id=self.completion_id,
+                object="chat.completion.chunk",
+                created=self.created,
+                model=self.model,
+                choices=[
+                    Choice(
+                        index=0,
+                        delta=ChoiceDelta(content="</think>"),
+                        finish_reason=None,
+                    )
+                ],
+            )
+            yield f"data: {close_chunk.model_dump_json()}\n\n"
+
         # emit role on first chunk only
         if self.first_chunk:
             self.first_chunk = False
@@ -666,6 +711,76 @@ class OpenAIChatCompletionsStreamTransformer:
                     Choice(
                         index=0,
                         delta=ChoiceDelta(content=text_content),
+                        finish_reason=None,
+                    )
+                ],
+            )
+
+        yield f"data: {chunk.model_dump_json()}\n\n"
+
+    async def _process_reasoning_message(self, message: ReasoningMessage) -> AsyncIterator[str]:
+        """
+        Convert ReasoningMessage to OpenAI ChatCompletionChunk with <think> tags.
+
+        Uses <think>...</think> format for compatibility with Open WebUI and other
+        frontends that display thinking/reasoning content in collapsible blocks.
+
+        Args:
+            message: Letta ReasoningMessage with reasoning content
+
+        Yields:
+            SSE-formatted chunk strings
+        """
+        reasoning_content = message.reasoning
+        if not reasoning_content:
+            return
+
+        # Track that we're in a thinking block (will close when assistant message comes)
+        if not self.in_thinking_block:
+            self.in_thinking_block = True
+            # Open the <think> tag
+            if self.first_chunk:
+                self.first_chunk = False
+                # First chunk includes role and opens <think> tag
+                chunk = ChatCompletionChunk(
+                    id=self.completion_id,
+                    object="chat.completion.chunk",
+                    created=self.created,
+                    model=self.model,
+                    choices=[
+                        Choice(
+                            index=0,
+                            delta=ChoiceDelta(role="assistant", content=f"<think>{reasoning_content}"),
+                            finish_reason=None,
+                        )
+                    ],
+                )
+            else:
+                # Open think tag (not first chunk overall)
+                chunk = ChatCompletionChunk(
+                    id=self.completion_id,
+                    object="chat.completion.chunk",
+                    created=self.created,
+                    model=self.model,
+                    choices=[
+                        Choice(
+                            index=0,
+                            delta=ChoiceDelta(content=f"<think>{reasoning_content}"),
+                            finish_reason=None,
+                        )
+                    ],
+                )
+        else:
+            # Continue streaming reasoning content (already inside <think> block)
+            chunk = ChatCompletionChunk(
+                id=self.completion_id,
+                object="chat.completion.chunk",
+                created=self.created,
+                model=self.model,
+                choices=[
+                    Choice(
+                        index=0,
+                        delta=ChoiceDelta(content=reasoning_content),
                         finish_reason=None,
                     )
                 ],
