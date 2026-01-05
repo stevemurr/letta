@@ -730,6 +730,13 @@ class OpenAIClient(LLMClientBase):
 
         # OpenAI's response structure directly maps to ChatCompletionResponse
         # We just need to instantiate the Pydantic model for validation and type safety.
+        # Handle case where usage is None (e.g., some OpenAI-compatible backends don't return usage with tool calls)
+        if response_data.get("usage") is None:
+            response_data["usage"] = {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            }
         chat_completion_response = ChatCompletionResponse(**response_data)
         chat_completion_response = self._fix_truncated_json_response(chat_completion_response)
 
