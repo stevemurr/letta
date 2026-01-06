@@ -1,5 +1,6 @@
 import json
 import time
+from abc import ABC, abstractmethod
 from typing import AsyncIterator, Optional, Union
 from uuid import uuid4
 
@@ -27,7 +28,14 @@ from letta.otel.metric_registry import MetricRegistry
 from letta.schemas.agent import AgentState
 from letta.schemas.enums import AgentType, MessageStreamStatus, RunStatus
 from letta.schemas.job import LettaRequestConfig
-from letta.schemas.letta_message import AssistantMessage, LettaErrorMessage, MessageType
+from letta.schemas.letta_message import (
+    AssistantMessage,
+    LettaErrorMessage,
+    MessageType,
+    ReasoningMessage,
+    ToolCallMessage,
+    ToolReturnMessage,
+)
 from letta.schemas.letta_message_content import TextContent
 from letta.schemas.letta_request import LettaStreamingRequest
 from letta.schemas.letta_response import LettaResponse
@@ -263,10 +271,17 @@ class StreamingService:
         model_name = agent.llm_config.model if agent.llm_config else "unknown"
         completion_id = f"chatcmpl-{run.id if run else str(uuid4())}"
 
-        transformer = OpenAIChatCompletionsStreamTransformer(
-            model=model_name,
-            completion_id=completion_id,
-        )
+        # select transformer based on settings
+        if settings.openai_stream_include_reasoning:
+            transformer = OpenAIStreamTransformerWithReasoning(
+                model=model_name,
+                completion_id=completion_id,
+            )
+        else:
+            transformer = OpenAIChatCompletionsStreamTransformer(
+                model=model_name,
+                completion_id=completion_id,
+            )
 
         # transform Letta SSE stream to OpenAI format (parser handles SSE strings)
         openai_stream = transformer.transform_stream(letta_stream)
@@ -513,10 +528,9 @@ class StreamingService:
         )
 
 
-class OpenAIChatCompletionsStreamTransformer:
+class BaseOpenAIStreamTransformer(ABC):
     """
-    Transforms Letta streaming messages into OpenAI ChatCompletionChunk format.
-    Filters out internal tool execution and only streams assistant text responses.
+    Abstract base class for transforming Letta streaming messages into OpenAI ChatCompletionChunk format.
     """
 
     def __init__(self, model: str, completion_id: str):
@@ -532,7 +546,6 @@ class OpenAIChatCompletionsStreamTransformer:
         self.first_chunk = True
         self.created = int(time.time())
 
-    # TODO: This is lowkey really ugly and poor code design, but this works fine for now
     def _parse_sse_chunk(self, sse_string: str):
         """
         Parse SSE-formatted string back into a message object.
@@ -560,6 +573,12 @@ class OpenAIChatCompletionsStreamTransformer:
 
                 if message_type == "assistant_message":
                     return AssistantMessage(**data)
+                elif message_type == "reasoning_message":
+                    return ReasoningMessage(**data)
+                elif message_type == "tool_call_message":
+                    return ToolCallMessage(**data)
+                elif message_type == "tool_return_message":
+                    return ToolReturnMessage(**data)
                 elif message_type == "usage_statistics":
                     return LettaUsageStatistics(**data)
                 elif message_type == "stop_reason":
@@ -573,9 +592,84 @@ class OpenAIChatCompletionsStreamTransformer:
             logger.warning(f"Failed to parse SSE chunk: {e}")
             return None
 
+    @abstractmethod
     async def transform_stream(self, letta_stream: AsyncIterator) -> AsyncIterator[str]:
         """
         Transform Letta stream to OpenAI ChatCompletionChunk SSE format.
+
+        Args:
+            letta_stream: Async iterator of Letta messages (may be SSE strings or objects)
+
+        Yields:
+            SSE-formatted strings: "data: {json}\n\n"
+        """
+        pass
+
+    def _create_chunk(self, content: str, role: Optional[str] = None, finish_reason: Optional[str] = None) -> ChatCompletionChunk:
+        """
+        Create an OpenAI ChatCompletionChunk.
+
+        Args:
+            content: The text content for this chunk
+            role: Optional role (only set on first chunk)
+            finish_reason: Optional finish reason (only set on final chunk)
+
+        Returns:
+            ChatCompletionChunk object
+        """
+        delta = ChoiceDelta(content=content)
+        if role:
+            delta = ChoiceDelta(role=role, content=content)
+        if finish_reason:
+            delta = ChoiceDelta()
+
+        return ChatCompletionChunk(
+            id=self.completion_id,
+            object="chat.completion.chunk",
+            created=self.created,
+            model=self.model,
+            choices=[
+                Choice(
+                    index=0,
+                    delta=delta,
+                    finish_reason=finish_reason,
+                )
+            ],
+        )
+
+    def _extract_text_content(self, content: Union[str, list[TextContent]]) -> str:
+        """
+        Extract text string from content field.
+
+        Args:
+            content: Either a string or list of TextContent objects
+
+        Returns:
+            Extracted text string
+        """
+        if isinstance(content, str):
+            return content
+        elif isinstance(content, list):
+            # concatenate all TextContent items
+            text_parts = []
+            for item in content:
+                if isinstance(item, TextContent):
+                    text_parts.append(item.text)
+            return "".join(text_parts)
+        return ""
+
+
+class OpenAIChatCompletionsStreamTransformer(BaseOpenAIStreamTransformer):
+    """
+    Transforms Letta streaming messages into OpenAI ChatCompletionChunk format.
+    Filters out internal tool execution and only streams assistant text responses.
+    This is the default transformer that maintains OpenAI API compatibility.
+    """
+
+    async def transform_stream(self, letta_stream: AsyncIterator) -> AsyncIterator[str]:
+        """
+        Transform Letta stream to OpenAI ChatCompletionChunk SSE format.
+        Only emits assistant messages, filtering out reasoning and tool calls.
 
         Args:
             letta_stream: Async iterator of Letta messages (may be SSE strings or objects)
@@ -596,25 +690,12 @@ class OpenAIChatCompletionsStreamTransformer:
                 # only process assistant messages
                 if isinstance(chunk, AssistantMessage):
                     async for sse_chunk in self._process_assistant_message(chunk):
-                        print(f"CHUNK: {sse_chunk}")
                         yield sse_chunk
 
                 # handle completion status
                 elif chunk == MessageStreamStatus.done:
                     # emit final chunk with finish_reason
-                    final_chunk = ChatCompletionChunk(
-                        id=self.completion_id,
-                        object="chat.completion.chunk",
-                        created=self.created,
-                        model=self.model,
-                        choices=[
-                            Choice(
-                                index=0,
-                                delta=ChoiceDelta(),
-                                finish_reason="stop",
-                            )
-                        ],
-                    )
+                    final_chunk = self._create_chunk("", finish_reason="stop")
                     yield f"data: {final_chunk.model_dump_json()}\n\n"
                     yield "data: [DONE]\n\n"
 
@@ -641,55 +722,200 @@ class OpenAIChatCompletionsStreamTransformer:
         # emit role on first chunk only
         if self.first_chunk:
             self.first_chunk = False
-            # first chunk includes role
-            chunk = ChatCompletionChunk(
-                id=self.completion_id,
-                object="chat.completion.chunk",
-                created=self.created,
-                model=self.model,
-                choices=[
-                    Choice(
-                        index=0,
-                        delta=ChoiceDelta(role="assistant", content=text_content),
-                        finish_reason=None,
-                    )
-                ],
-            )
+            chunk = self._create_chunk(text_content, role="assistant")
         else:
-            # subsequent chunks just have content
-            chunk = ChatCompletionChunk(
-                id=self.completion_id,
-                object="chat.completion.chunk",
-                created=self.created,
-                model=self.model,
-                choices=[
-                    Choice(
-                        index=0,
-                        delta=ChoiceDelta(content=text_content),
-                        finish_reason=None,
-                    )
-                ],
-            )
+            chunk = self._create_chunk(text_content)
 
         yield f"data: {chunk.model_dump_json()}\n\n"
 
-    def _extract_text_content(self, content: Union[str, list[TextContent]]) -> str:
+
+class OpenAIStreamTransformerWithReasoning(BaseOpenAIStreamTransformer):
+    """
+    Transforms Letta streaming messages into OpenAI ChatCompletionChunk format,
+    including reasoning/thinking content and tool call status.
+
+    Reasoning content is wrapped in <think> tags for frontend display.
+    Tool calls are streamed as status updates to show agent progress.
+    """
+
+    def __init__(self, model: str, completion_id: str):
+        super().__init__(model, completion_id)
+        self.in_thinking_block = False
+        self.has_emitted_content = False
+
+    async def transform_stream(self, letta_stream: AsyncIterator) -> AsyncIterator[str]:
         """
-        Extract text string from content field.
+        Transform Letta stream to OpenAI ChatCompletionChunk SSE format.
+        Includes reasoning messages wrapped in <think> tags and tool call status.
 
         Args:
-            content: Either a string or list of TextContent objects
+            letta_stream: Async iterator of Letta messages (may be SSE strings or objects)
 
-        Returns:
-            Extracted text string
+        Yields:
+            SSE-formatted strings: "data: {json}\n\n"
         """
-        if isinstance(content, str):
-            return content
-        elif isinstance(content, list):
-            # concatenate all TextContent items
-            text_parts = []
-            for item in content:
-                if isinstance(item, TextContent):
-                    text_parts.append(item.text)
-            return "".join(text_parts)
-        return ""
+        try:
+            async for raw_chunk in letta_stream:
+                # parse SSE string if needed
+                if isinstance(raw_chunk, str):
+                    chunk = self._parse_sse_chunk(raw_chunk)
+                    if chunk is None:
+                        continue  # skip unparseable or filtered chunks
+                else:
+                    chunk = raw_chunk
+
+                # process reasoning messages
+                if isinstance(chunk, ReasoningMessage):
+                    async for sse_chunk in self._process_reasoning_message(chunk):
+                        yield sse_chunk
+
+                # process tool call messages
+                elif isinstance(chunk, ToolCallMessage):
+                    async for sse_chunk in self._process_tool_call_message(chunk):
+                        yield sse_chunk
+
+                # process tool return messages
+                elif isinstance(chunk, ToolReturnMessage):
+                    async for sse_chunk in self._process_tool_return_message(chunk):
+                        yield sse_chunk
+
+                # process assistant messages
+                elif isinstance(chunk, AssistantMessage):
+                    async for sse_chunk in self._process_assistant_message(chunk):
+                        yield sse_chunk
+
+                # handle completion status
+                elif chunk == MessageStreamStatus.done:
+                    # close thinking block if still open
+                    if self.in_thinking_block:
+                        async for sse_chunk in self._close_thinking_block():
+                            yield sse_chunk
+
+                    # emit final chunk with finish_reason
+                    final_chunk = self._create_chunk("", finish_reason="stop")
+                    yield f"data: {final_chunk.model_dump_json()}\n\n"
+                    yield "data: [DONE]\n\n"
+
+        except Exception as e:
+            logger.error(f"Error in OpenAI stream transformation with reasoning: {e}", exc_info=True)
+            error_chunk = {"error": {"message": str(e), "type": "server_error"}}
+            yield f"data: {json.dumps(error_chunk)}\n\n"
+
+    async def _process_reasoning_message(self, message: ReasoningMessage) -> AsyncIterator[str]:
+        """
+        Process reasoning/thinking message and wrap in <think> tags.
+
+        Args:
+            message: ReasoningMessage with reasoning content
+
+        Yields:
+            SSE-formatted chunk strings
+        """
+        reasoning_content = message.reasoning
+        if not reasoning_content:
+            return
+
+        # open thinking block if not already open
+        if not self.in_thinking_block:
+            self.in_thinking_block = True
+            # emit role on first chunk
+            if not self.has_emitted_content:
+                self.has_emitted_content = True
+                self.first_chunk = False
+                chunk = self._create_chunk("<think>\n", role="assistant")
+            else:
+                chunk = self._create_chunk("<think>\n")
+            yield f"data: {chunk.model_dump_json()}\n\n"
+
+        # emit reasoning content
+        chunk = self._create_chunk(reasoning_content)
+        yield f"data: {chunk.model_dump_json()}\n\n"
+
+    async def _close_thinking_block(self) -> AsyncIterator[str]:
+        """Close the thinking block with </think> tag."""
+        if self.in_thinking_block:
+            self.in_thinking_block = False
+            chunk = self._create_chunk("\n</think>\n\n")
+            yield f"data: {chunk.model_dump_json()}\n\n"
+
+    async def _process_tool_call_message(self, message: ToolCallMessage) -> AsyncIterator[str]:
+        """
+        Process tool call message and emit as status update.
+
+        Args:
+            message: ToolCallMessage with tool call details
+
+        Yields:
+            SSE-formatted chunk strings
+        """
+        # close thinking block before tool call
+        if self.in_thinking_block:
+            async for sse_chunk in self._close_thinking_block():
+                yield sse_chunk
+
+        # extract tool name and arguments
+        tool_call = message.tool_call
+        if tool_call:
+            tool_name = tool_call.function.name if hasattr(tool_call, "function") else str(tool_call)
+            # emit tool call status
+            status_text = f"🔧 Calling tool: {tool_name}\n"
+
+            if not self.has_emitted_content:
+                self.has_emitted_content = True
+                self.first_chunk = False
+                chunk = self._create_chunk(status_text, role="assistant")
+            else:
+                chunk = self._create_chunk(status_text)
+            yield f"data: {chunk.model_dump_json()}\n\n"
+
+    async def _process_tool_return_message(self, message: ToolReturnMessage) -> AsyncIterator[str]:
+        """
+        Process tool return message and emit result status.
+
+        Args:
+            message: ToolReturnMessage with tool execution result
+
+        Yields:
+            SSE-formatted chunk strings
+        """
+        status = message.status
+        status_emoji = "✅" if status == "success" else "❌"
+        status_text = f"{status_emoji} Tool completed: {status}\n\n"
+
+        if not self.has_emitted_content:
+            self.has_emitted_content = True
+            self.first_chunk = False
+            chunk = self._create_chunk(status_text, role="assistant")
+        else:
+            chunk = self._create_chunk(status_text)
+        yield f"data: {chunk.model_dump_json()}\n\n"
+
+    async def _process_assistant_message(self, message: AssistantMessage) -> AsyncIterator[str]:
+        """
+        Convert AssistantMessage to OpenAI ChatCompletionChunk(s).
+
+        Args:
+            message: Letta AssistantMessage with content
+
+        Yields:
+            SSE-formatted chunk strings
+        """
+        # close thinking block before assistant message
+        if self.in_thinking_block:
+            async for sse_chunk in self._close_thinking_block():
+                yield sse_chunk
+
+        # extract text from content (can be string or list of TextContent)
+        text_content = self._extract_text_content(message.content)
+        if not text_content:
+            return
+
+        # emit role on first chunk only
+        if not self.has_emitted_content:
+            self.has_emitted_content = True
+            self.first_chunk = False
+            chunk = self._create_chunk(text_content, role="assistant")
+        else:
+            chunk = self._create_chunk(text_content)
+
+        yield f"data: {chunk.model_dump_json()}\n\n"

@@ -245,6 +245,13 @@ class Settings(BaseSettings):
     # SSE Streaming cancellation settings
     enable_cancellation_aware_streaming: bool = Field(True, description="Enable cancellation aware streaming")
 
+    # OpenAI chat completions streaming settings
+    openai_stream_include_reasoning: bool = Field(
+        default=False,
+        description="Include reasoning messages and tool call status in OpenAI-compatible chat completions streaming. "
+        "When enabled, reasoning content is wrapped in <think> tags and tool calls are streamed as status updates.",
+    )
+
     # default handles
     default_llm_handle: Optional[str] = None
     default_embedding_handle: Optional[str] = None
