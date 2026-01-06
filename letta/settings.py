@@ -249,7 +249,11 @@ class Settings(BaseSettings):
     openai_stream_include_reasoning: bool = Field(
         default=False,
         description="Include reasoning messages and tool call status in OpenAI-compatible chat completions streaming. "
-        "When enabled, reasoning content is wrapped in <think> tags and tool calls are streamed as status updates.",
+        "When enabled, reasoning content and tool calls are streamed according to the output format.",
+    )
+    openai_stream_output_format: str = Field(
+        default="plain",
+        description="Output format for reasoning/tool streaming. Options: 'plain' (emoji text), 'openwebui' (details tags), 'markdown' (collapsible markdown).",
     )
 
     # default handles

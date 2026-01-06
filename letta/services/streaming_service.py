@@ -273,9 +273,12 @@ class StreamingService:
 
         # select transformer based on settings
         if settings.openai_stream_include_reasoning:
+            # get the configured output formatter
+            formatter = get_output_formatter(settings.openai_stream_output_format)
             transformer = OpenAIStreamTransformerWithReasoning(
                 model=model_name,
                 completion_id=completion_id,
+                formatter=formatter,
             )
         else:
             transformer = OpenAIChatCompletionsStreamTransformer(
@@ -729,24 +732,178 @@ class OpenAIChatCompletionsStreamTransformer(BaseOpenAIStreamTransformer):
         yield f"data: {chunk.model_dump_json()}\n\n"
 
 
+class StreamOutputFormatter(ABC):
+    """
+    Abstract base class for formatting streaming output.
+    Different formatters produce different output styles for reasoning and tool calls.
+    """
+
+    @abstractmethod
+    def format_thinking_open(self) -> str:
+        """Return the opening tag/marker for thinking/reasoning content."""
+        pass
+
+    @abstractmethod
+    def format_thinking_close(self) -> str:
+        """Return the closing tag/marker for thinking/reasoning content."""
+        pass
+
+    @abstractmethod
+    def format_tool_call(self, tool_name: str, tool_call_id: str, arguments: str) -> str:
+        """
+        Format a tool call message.
+
+        Args:
+            tool_name: Name of the tool being called
+            tool_call_id: Unique ID for this tool call
+            arguments: JSON string of tool arguments
+
+        Returns:
+            Formatted string for the tool call
+        """
+        pass
+
+    @abstractmethod
+    def format_tool_result(self, tool_name: str, tool_call_id: str, status: str, result: Optional[str] = None) -> str:
+        """
+        Format a tool result message.
+
+        Args:
+            tool_name: Name of the tool that was called
+            tool_call_id: Unique ID for this tool call
+            status: Status of the tool execution (success/error)
+            result: Optional result content
+
+        Returns:
+            Formatted string for the tool result
+        """
+        pass
+
+
+class PlainTextFormatter(StreamOutputFormatter):
+    """
+    Plain text formatter using emoji indicators.
+    Output style: "🔧 Calling tool: search\n" and "✅ Tool completed: success\n"
+    """
+
+    def format_thinking_open(self) -> str:
+        return "<think>\n"
+
+    def format_thinking_close(self) -> str:
+        return "\n</think>\n\n"
+
+    def format_tool_call(self, tool_name: str, tool_call_id: str, arguments: str) -> str:
+        return f"🔧 Calling tool: {tool_name}\n"
+
+    def format_tool_result(self, tool_name: str, tool_call_id: str, status: str, result: Optional[str] = None) -> str:
+        status_emoji = "✅" if status == "success" else "❌"
+        return f"{status_emoji} Tool completed: {status}\n\n"
+
+
+class OpenWebUIFormatter(StreamOutputFormatter):
+    """
+    Open WebUI formatter using <details> tags.
+    Produces collapsible tool call sections that render natively in Open WebUI.
+
+    Format:
+    <details type="tool_calls" done="false" id="call-1" name="search" arguments="{...}">
+    <summary>Calling search...</summary>
+    </details>
+    """
+
+    def format_thinking_open(self) -> str:
+        return "<think>\n"
+
+    def format_thinking_close(self) -> str:
+        return "\n</think>\n\n"
+
+    def format_tool_call(self, tool_name: str, tool_call_id: str, arguments: str) -> str:
+        # Escape arguments for HTML attribute
+        escaped_args = self._escape_html_attr(arguments)
+        return (
+            f'<details type="tool_calls" done="false" id="{tool_call_id}" '
+            f'name="{tool_name}" arguments="{escaped_args}">\n'
+            f"<summary>Calling {tool_name}...</summary>\n"
+            f"</details>\n\n"
+        )
+
+    def format_tool_result(self, tool_name: str, tool_call_id: str, status: str, result: Optional[str] = None) -> str:
+        # Escape result for HTML attribute
+        escaped_result = self._escape_html_attr(result or "")
+        return (
+            f'<details type="tool_calls" done="true" id="{tool_call_id}" '
+            f'name="{tool_name}" result="{escaped_result}" status="{status}">\n'
+            f"<summary>{tool_name} completed</summary>\n"
+            f"</details>\n\n"
+        )
+
+    def _escape_html_attr(self, value: str) -> str:
+        """Escape a string for use in HTML attribute."""
+        return value.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "&#10;")
+
+
+class MarkdownFormatter(StreamOutputFormatter):
+    """
+    Markdown formatter using collapsible details sections.
+    Works in markdown renderers that support HTML details tags.
+    """
+
+    def format_thinking_open(self) -> str:
+        return "<details open>\n<summary>💭 Thinking...</summary>\n\n"
+
+    def format_thinking_close(self) -> str:
+        return "\n</details>\n\n"
+
+    def format_tool_call(self, tool_name: str, tool_call_id: str, arguments: str) -> str:
+        return f"<details open>\n<summary>🔧 Calling {tool_name}</summary>\n\n```json\n{arguments}\n```\n</details>\n\n"
+
+    def format_tool_result(self, tool_name: str, tool_call_id: str, status: str, result: Optional[str] = None) -> str:
+        status_emoji = "✅" if status == "success" else "❌"
+        result_block = f"\n```\n{result}\n```" if result else ""
+        return f"<details>\n<summary>{status_emoji} {tool_name} - {status}</summary>\n{result_block}\n</details>\n\n"
+
+
+def get_output_formatter(format_name: str) -> StreamOutputFormatter:
+    """
+    Factory function to get the appropriate output formatter.
+
+    Args:
+        format_name: Name of the format ('plain', 'openwebui', 'markdown')
+
+    Returns:
+        StreamOutputFormatter instance
+    """
+    formatters = {
+        "plain": PlainTextFormatter,
+        "openwebui": OpenWebUIFormatter,
+        "markdown": MarkdownFormatter,
+    }
+
+    formatter_class = formatters.get(format_name.lower(), PlainTextFormatter)
+    return formatter_class()
+
+
 class OpenAIStreamTransformerWithReasoning(BaseOpenAIStreamTransformer):
     """
     Transforms Letta streaming messages into OpenAI ChatCompletionChunk format,
     including reasoning/thinking content and tool call status.
 
-    Reasoning content is wrapped in <think> tags for frontend display.
-    Tool calls are streamed as status updates to show agent progress.
+    Uses pluggable output formatters to support different frontend styles.
     """
 
-    def __init__(self, model: str, completion_id: str):
+    def __init__(self, model: str, completion_id: str, formatter: Optional[StreamOutputFormatter] = None):
         super().__init__(model, completion_id)
         self.in_thinking_block = False
         self.has_emitted_content = False
+        self.formatter = formatter or PlainTextFormatter()
+        # Track current tool call for matching with results
+        self.current_tool_call_id: Optional[str] = None
+        self.current_tool_name: Optional[str] = None
 
     async def transform_stream(self, letta_stream: AsyncIterator) -> AsyncIterator[str]:
         """
         Transform Letta stream to OpenAI ChatCompletionChunk SSE format.
-        Includes reasoning messages wrapped in <think> tags and tool call status.
+        Includes reasoning messages and tool call status using the configured formatter.
 
         Args:
             letta_stream: Async iterator of Letta messages (may be SSE strings or objects)
@@ -803,7 +960,7 @@ class OpenAIStreamTransformerWithReasoning(BaseOpenAIStreamTransformer):
 
     async def _process_reasoning_message(self, message: ReasoningMessage) -> AsyncIterator[str]:
         """
-        Process reasoning/thinking message and wrap in <think> tags.
+        Process reasoning/thinking message using the configured formatter.
 
         Args:
             message: ReasoningMessage with reasoning content
@@ -818,13 +975,14 @@ class OpenAIStreamTransformerWithReasoning(BaseOpenAIStreamTransformer):
         # open thinking block if not already open
         if not self.in_thinking_block:
             self.in_thinking_block = True
+            opening = self.formatter.format_thinking_open()
             # emit role on first chunk
             if not self.has_emitted_content:
                 self.has_emitted_content = True
                 self.first_chunk = False
-                chunk = self._create_chunk("<think>\n", role="assistant")
+                chunk = self._create_chunk(opening, role="assistant")
             else:
-                chunk = self._create_chunk("<think>\n")
+                chunk = self._create_chunk(opening)
             yield f"data: {chunk.model_dump_json()}\n\n"
 
         # emit reasoning content
@@ -832,15 +990,16 @@ class OpenAIStreamTransformerWithReasoning(BaseOpenAIStreamTransformer):
         yield f"data: {chunk.model_dump_json()}\n\n"
 
     async def _close_thinking_block(self) -> AsyncIterator[str]:
-        """Close the thinking block with </think> tag."""
+        """Close the thinking block using the configured formatter."""
         if self.in_thinking_block:
             self.in_thinking_block = False
-            chunk = self._create_chunk("\n</think>\n\n")
+            closing = self.formatter.format_thinking_close()
+            chunk = self._create_chunk(closing)
             yield f"data: {chunk.model_dump_json()}\n\n"
 
     async def _process_tool_call_message(self, message: ToolCallMessage) -> AsyncIterator[str]:
         """
-        Process tool call message and emit as status update.
+        Process tool call message using the configured formatter.
 
         Args:
             message: ToolCallMessage with tool call details
@@ -856,9 +1015,27 @@ class OpenAIStreamTransformerWithReasoning(BaseOpenAIStreamTransformer):
         # extract tool name and arguments
         tool_call = message.tool_call
         if tool_call:
-            tool_name = tool_call.function.name if hasattr(tool_call, "function") else str(tool_call)
-            # emit tool call status
-            status_text = f"🔧 Calling tool: {tool_name}\n"
+            # Handle both ToolCall (name, arguments, tool_call_id) and OpenAI-style (function.name)
+            if hasattr(tool_call, "function") and tool_call.function:
+                tool_name = tool_call.function.name
+                arguments = tool_call.function.arguments
+                tool_call_id = tool_call.id if hasattr(tool_call, "id") else f"call-{self.completion_id}"
+            elif hasattr(tool_call, "name") and tool_call.name:
+                tool_name = tool_call.name
+                arguments = tool_call.arguments if hasattr(tool_call, "arguments") else "{}"
+                tool_call_id = tool_call.tool_call_id if hasattr(tool_call, "tool_call_id") else f"call-{self.completion_id}"
+            else:
+                # Fallback - try to extract from string representation
+                tool_name = str(tool_call)
+                arguments = "{}"
+                tool_call_id = f"call-{self.completion_id}"
+
+            # Track current tool call for result matching
+            self.current_tool_call_id = tool_call_id
+            self.current_tool_name = tool_name
+
+            # Format using the configured formatter
+            status_text = self.formatter.format_tool_call(tool_name, tool_call_id, arguments)
 
             if not self.has_emitted_content:
                 self.has_emitted_content = True
@@ -870,7 +1047,7 @@ class OpenAIStreamTransformerWithReasoning(BaseOpenAIStreamTransformer):
 
     async def _process_tool_return_message(self, message: ToolReturnMessage) -> AsyncIterator[str]:
         """
-        Process tool return message and emit result status.
+        Process tool return message using the configured formatter.
 
         Args:
             message: ToolReturnMessage with tool execution result
@@ -879,8 +1056,16 @@ class OpenAIStreamTransformerWithReasoning(BaseOpenAIStreamTransformer):
             SSE-formatted chunk strings
         """
         status = message.status
-        status_emoji = "✅" if status == "success" else "❌"
-        status_text = f"{status_emoji} Tool completed: {status}\n\n"
+        tool_call_id = self.current_tool_call_id or f"call-{self.completion_id}"
+        tool_name = self.current_tool_name or "unknown"
+
+        # Get result content if available
+        result_content = None
+        if hasattr(message, "tool_return") and message.tool_return:
+            result_content = str(message.tool_return)[:500]  # Truncate long results
+
+        # Format using the configured formatter
+        status_text = self.formatter.format_tool_result(tool_name, tool_call_id, status, result_content)
 
         if not self.has_emitted_content:
             self.has_emitted_content = True
@@ -889,6 +1074,10 @@ class OpenAIStreamTransformerWithReasoning(BaseOpenAIStreamTransformer):
         else:
             chunk = self._create_chunk(status_text)
         yield f"data: {chunk.model_dump_json()}\n\n"
+
+        # Clear tracked tool call
+        self.current_tool_call_id = None
+        self.current_tool_name = None
 
     async def _process_assistant_message(self, message: AssistantMessage) -> AsyncIterator[str]:
         """
