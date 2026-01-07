@@ -888,7 +888,9 @@ class SimpleOpenAIStreamingInterface:
 
                     delta = ToolCallDelta(
                         name=tool_call.function.name if (tool_call.function and tool_call.function.name) else None,
-                        arguments=tool_call.function.arguments if (tool_call.function and tool_call.function.arguments) else None,
+                        arguments=tool_call.function.arguments
+                        if (tool_call.function and tool_call.function.arguments is not None)
+                        else None,
                         tool_call_id=resolved_id,
                     )
 
